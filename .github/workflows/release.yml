@@ -26,12 +26,12 @@ jobs:
       - name: Build swooshhh.exe
         run: |
           if (Test-Path swooshhh_logo.png) {
-            python -c "from PIL import Image; i=Image.open('swooshhh_logo.png').convert('RGBA'); i.save('swooshhh.ico', format='ICO', sizes=[(256,256),(48,48),(32,32),(16,16)])"
+            python make_ico.py
           }
           if (Test-Path swooshhh.ico) {
-            pyinstaller --onefile --windowed --name swooshhh swooshhh.py --add-data "swooshhh_logo.png;." --icon swooshhh.ico
+            pyinstaller --onefile --windowed --name swooshhh swooshhh.py --icon swooshhh.ico
           } elseif (Test-Path swooshhh_logo.png) {
-            pyinstaller --onefile --windowed --name swooshhh swooshhh.py --add-data "swooshhh_logo.png;."
+            pyinstaller --onefile --windowed --name swooshhh swooshhh.py
           } else {
             pyinstaller --onefile --windowed --name swooshhh swooshhh.py
           }

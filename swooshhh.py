@@ -16,7 +16,6 @@ import argparse
 import atexit
 import ctypes
 import math
-import os
 import sys
 import threading
 import time
@@ -32,17 +31,22 @@ import pystray
 byref = ctypes.byref
 user32 = ctypes.windll.user32
 gdi32 = ctypes.windll.gdi32
+kernel32 = ctypes.windll.kernel32
 WM_HOTKEY = 0x0312
 WH_MOUSE_LL = 14
 WM_RBUTTONDOWN = 0x0204
 WM_RBUTTONUP = 0x0205
 WM_TIMER = 0x0113
 WM_DESTROY = 0x0002
+WM_MOUSEACTIVATE = 0x0021
+MA_NOACTIVATE = 3
 GA_ROOT = 2
 WS_POPUP = 0x80000000
 WS_EX_LAYERED = 0x00080000
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_TOPMOST = 0x00000008
+WS_EX_TRANSPARENT = 0x00000020
+WS_EX_NOACTIVATE = 0x08000000
 SW_HIDE = 0
 SW_SHOWNOACTIVATE = 4
 LWA_ALPHA = 0x2
@@ -79,7 +83,9 @@ POLL_INTERVAL = 0.035
 # If revealed window is dragged this many px away from docked position, unpin (leave window where it is)
 DRAG_UNPIN_THRESHOLD_PX = 10
 # Right-click title bar + drag to edge: cursor within this many px of screen edge on release
-DRAG_EDGE_ZONE_PX = 50
+DRAG_EDGE_ZONE_PX = 80
+# Short slide animation when hiding via right-click-drag (ms)
+HIDE_ANIMATION_MS = 120
 # Hotkeys: Ctrl+Alt+Arrow = hide focused window to that edge (one window per edge, 4 max)
 MOD_HOTKEY = win32con.MOD_ALT | win32con.MOD_CONTROL
 VK_LEFT = 0x25
@@ -111,16 +117,21 @@ def get_window_rect(hwnd):
 def set_window_rect(hwnd, rect, flags=0):
     if rect is None:
         return
+    if is_our_process_window(hwnd):
+        return
     flags = flags or win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE
-    win32gui.SetWindowPos(
-        hwnd,
-        win32con.HWND_TOP,
-        rect.left,
-        rect.top,
-        rect.right - rect.left,
-        rect.bottom - rect.top,
-        flags,
-    )
+    try:
+        win32gui.SetWindowPos(
+            hwnd,
+            win32con.HWND_TOP,
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            flags,
+        )
+    except Exception:
+        pass
 
 
 def get_cursor_pos():
@@ -144,6 +155,18 @@ def is_window_valid(hwnd):
         return False
     try:
         return win32gui.IsWindow(hwnd) and win32gui.IsWindowVisible(hwnd)
+    except Exception:
+        return False
+
+
+def is_our_process_window(hwnd):
+    """True if the window belongs to our process (never manage our own GUI/overlays)."""
+    if not hwnd:
+        return False
+    try:
+        pid = ctypes.c_ulong()
+        user32.GetWindowThreadProcessId(hwnd, byref(pid))
+        return pid.value == kernel32.GetCurrentProcessId()
     except Exception:
         return False
 
@@ -227,13 +250,16 @@ def _low_level_mouse_proc(nCode, wParam, lParam):
             if wParam == WM_RBUTTONDOWN:
                 hwnd = user32.WindowFromPoint(wintypes.POINT(x, y))
                 root = get_root_window(hwnd)
-                _mouse_drag_hwnd = root if (root and is_window_valid(root)) else None
+                if root and is_window_valid(root) and not is_our_process_window(root):
+                    _mouse_drag_hwnd = root
+                else:
+                    _mouse_drag_hwnd = None
             elif wParam == WM_RBUTTONUP:
                 if _mouse_drag_hwnd is not None and _hotkey_thread_id is not None and _mouse_slider_ref:
                     try:
                         vleft, vtop, vright, vbottom = get_virtual_screen_rect()
                         edge = _edge_from_cursor(x, y, vleft, vtop, vright, vbottom)
-                        if edge and is_window_valid(_mouse_drag_hwnd):
+                        if edge and not is_our_process_window(_mouse_drag_hwnd) and is_window_valid(_mouse_drag_hwnd):
                             edge_index = EDGES.index(edge)
                             user32.PostThreadMessageW(
                                 _hotkey_thread_id, WM_APP_HIDE_TO_EDGE,
@@ -251,7 +277,8 @@ def run_hotkey_thread(slider):
     """Run a message loop; hotkeys + right-click-drag-to-edge hide windows."""
     global _mouse_hook_handle, _mouse_slider_ref, _hotkey_thread_id
     _mouse_slider_ref.append(slider)
-    kernel32 = ctypes.windll.kernel32
+    # Brief delay so tray/GUI can start first and reduce mouse lag at launch
+    time.sleep(0.4)
     _hotkey_thread_id = kernel32.GetCurrentThreadId()
 
     LRESULT = ctypes.c_longlong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_long
@@ -291,6 +318,7 @@ def run_hotkey_thread(slider):
 class WindowSlider:
     def __init__(self):
         self.edge = EDGE_LEFT  # selected edge for GUI (Pin/Unpin/Hide/Show)
+        # Start with nothing hidden; no persistence of window placement
         self._slots = {
             e: {"hwnd": None, "saved_rect": None, "hidden": False, "_polls": 0}
             for e in EDGES
@@ -305,7 +333,7 @@ class WindowSlider:
     def pin_current(self):
         """Pin the focused window to the currently selected edge (replaces any window on that edge)."""
         hwnd = get_foreground_hwnd()
-        if not hwnd or not is_window_valid(hwnd):
+        if not hwnd or not is_window_valid(hwnd) or is_our_process_window(hwnd):
             return False
         edge = self.edge
         with self._lock:
@@ -365,7 +393,7 @@ class WindowSlider:
 
     def pin_hwnd_and_hide_to_edge(self, hwnd, edge):
         """Pin the given window to this edge and hide it (used by mouse drag-to-edge)."""
-        if edge not in EDGES or not hwnd or not is_window_valid(hwnd):
+        if edge not in EDGES or not hwnd or not is_window_valid(hwnd) or is_our_process_window(hwnd):
             return False
         with self._lock:
             self._remove_hwnd_from_other_edges(hwnd, edge)
@@ -403,6 +431,10 @@ class WindowSlider:
                     polls = self._slots[edge]["_polls"]
 
                 if not hwnd or not saved or not is_window_valid(hwnd):
+                    continue
+                if is_our_process_window(hwnd):
+                    with self._lock:
+                        self._clear_slot(edge, restore=False)
                     continue
 
                 try:
@@ -489,7 +521,7 @@ class WindowSlider:
             self._stop.wait(POLL_INTERVAL)
 
     def _hide_to_edge(self, edge):
-        """Immediately move the window in slot[edge] off-screen (no animation)."""
+        """Move the window in slot[edge] off-screen, with a short slide animation."""
         with self._lock:
             hwnd = self._slots[edge]["hwnd"]
             saved = self._slots[edge]["saved_rect"]
@@ -509,6 +541,15 @@ class WindowSlider:
             hidden_rect = SavedRect(saved.left, vtop - height + PEEK_PX, saved.right, vtop + PEEK_PX)
         else:
             hidden_rect = SavedRect(saved.left, vbottom - PEEK_PX, saved.right, vbottom - PEEK_PX + height)
+
+        # Short slide animation toward the edge before fully hidden
+        steps = max(1, int(HIDE_ANIMATION_MS / (POLL_INTERVAL * 1000)))
+        for i in range(1, steps + 1):
+            t = i / steps
+            t = 0.5 - 0.5 * math.cos(math.pi * t)  # ease in-out
+            new_rect = _interp_rect(rect, hidden_rect, t)
+            set_window_rect(hwnd, new_rect)
+            time.sleep(POLL_INTERVAL)
         set_window_rect(hwnd, hidden_rect)
         with self._lock:
             self._slots[edge]["saved_rect"] = saved
@@ -577,6 +618,8 @@ def _indicator_wndproc(hwnd, msg, wParam, lParam):
     if msg == WM_DESTROY:
         user32.PostQuitMessage(0)
         return 0
+    if msg == WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE
     if msg == WM_TIMER:
         state = _indicator_state
         slider = state.get("slider")
@@ -645,7 +688,7 @@ def _run_edge_indicators(slider):
         gdi32.DeleteObject(brush)
         return
 
-    ex = WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST
+    ex = WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE
     vleft, vtop, vright, vbottom = get_virtual_screen_rect()
     vw = vright - vleft
     vh = vbottom - vtop
@@ -757,11 +800,15 @@ def make_tray_icon(slider):
                 root.deiconify()
                 root.lift()
                 root.focus_force()
+                if hasattr(root, "_center_on_screen"):
+                    root._center_on_screen()
         except Exception:
             pass
 
-    def show_hide_swooshhh_label(icon, item):
-        root = getattr(icon, "_gui_root", None)
+    def show_hide_swooshhh_label(*args, **kwargs):
+        """Dynamic menu label; pystray may call with (icon, item) or (item) depending on version."""
+        icon = args[0] if args else kwargs.get("icon")
+        root = getattr(icon, "_gui_root", None) if icon else None
         if not root:
             return "Show Swooshhh"
         try:
@@ -778,25 +825,12 @@ def make_tray_icon(slider):
                 pass
         icon.stop()
 
-    # Tray icon: use logo PNG if available, else fallback to drawn icon
-    img = None
-    if getattr(sys, "frozen", False):
-        logo_path = os.path.join(sys._MEIPASS, "swooshhh_logo.png")
-    else:
-        logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "swooshhh_logo.png")
-    try:
-        if os.path.isfile(logo_path):
-            img = Image.open(logo_path).copy()
-            img = img.convert("RGB")
-            img = img.resize((64, 64), getattr(Image, "Resampling", Image).LANCZOS)
-    except Exception:
-        pass
-    if img is None:
-        img = Image.new("RGB", (64, 64), color=(45, 55, 72))
-        draw = ImageDraw.Draw(img)
-        draw.rectangle([8, 8, 56, 56], outline=(99, 179, 237), width=2)
-        draw.rectangle([0, 24, 12, 40], fill=(99, 179, 237))
-        del draw
+    # Tray icon: drawn square with blue indicator (64x64 - Windows scales for tray)
+    img = Image.new("RGB", (64, 64), color=(45, 55, 72))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([8, 8, 56, 56], outline=(99, 179, 237), width=2)
+    draw.rectangle([0, 24, 12, 40], fill=(99, 179, 237))
+    del draw
 
     menu = pystray.Menu(
         pystray.MenuItem("Pin current window", on_pin),
@@ -830,6 +864,20 @@ def run_gui(slider, start_minimized=False):
     root.title("Swooshhh")
     root.minsize(320, 220)
     root.resizable(True, True)
+
+    def center_on_screen():
+        """Place window at center of virtual screen; do not use last position."""
+        root.update_idletasks()
+        vleft, vtop, vright, vbottom = get_virtual_screen_rect()
+        vw = vright - vleft
+        vh = vbottom - vtop
+        w = root.winfo_reqwidth()
+        h = root.winfo_reqheight()
+        x = vleft + (vw - w) // 2
+        y = vtop + (vh - h) // 2
+        root.geometry(f"+{x}+{y}")
+
+    root._center_on_screen = center_on_screen
 
     main = ttk.Frame(root, padding=12)
     main.pack(fill=tk.BOTH, expand=True)
@@ -898,7 +946,10 @@ def run_gui(slider, start_minimized=False):
     if start_minimized:
         root.withdraw()
     else:
-        root.after(100, root.deiconify)
+        def show_centered():
+            root.deiconify()
+            center_on_screen()
+        root.after(100, show_centered)
 
     return root
 
@@ -962,8 +1013,16 @@ def main():
     icon = make_tray_icon(slider)
     if args.gui:
         icon._gui_root = root
-        threading.Thread(target=icon.run, daemon=True).start()
-        root.mainloop()
+        # Windows: tray icon must run on main thread with its own message loop
+        gui_thread = threading.Thread(target=root.mainloop, daemon=True)
+        gui_thread.start()
+        try:
+            icon.run()
+        finally:
+            try:
+                root.quit()
+            except Exception:
+                pass
     else:
         icon.run()
 
