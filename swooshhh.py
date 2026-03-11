@@ -13,8 +13,10 @@ Security: No network, no disk writes, no eval/exec. Uses only Win32 APIs.
 """
 
 import argparse
+import atexit
 import ctypes
 import math
+import os
 import sys
 import threading
 import time
@@ -74,6 +76,8 @@ PEEK_PX = 4
 TRIGGER_ZONE_PX = 14
 ANIMATION_MS = 200
 POLL_INTERVAL = 0.035
+# If revealed window is dragged this many px away from docked position, unpin (leave window where it is)
+DRAG_UNPIN_THRESHOLD_PX = 10
 # Right-click title bar + drag to edge: cursor within this many px of screen edge on release
 DRAG_EDGE_ZONE_PX = 50
 # Hotkeys: Ctrl+Alt+Arrow = hide focused window to that edge (one window per edge, 4 max)
@@ -314,9 +318,10 @@ class WindowSlider:
             self._ensure_worker()
         return True
 
-    def _clear_slot(self, edge):
+    def _clear_slot(self, edge, restore=True):
+        """Clear the slot. If restore=True and window was hidden, move it back to saved_rect."""
         s = self._slots[edge]
-        if s["hwnd"] and s["saved_rect"] and s["hidden"]:
+        if restore and s["hwnd"] and s["saved_rect"] and s["hidden"]:
             set_window_rect(s["hwnd"], s["saved_rect"])
         s["hwnd"] = None
         s["saved_rect"] = None
@@ -449,6 +454,16 @@ class WindowSlider:
                             pass
                     else:
                         # Visible: stay open while cursor is over window; slide out when cursor leaves
+                        # If user dragged the window away from docked position, unpin (leave window where it is)
+                        if (
+                            abs(rect.left - visible_rect.left) > DRAG_UNPIN_THRESHOLD_PX
+                            or abs(rect.top - visible_rect.top) > DRAG_UNPIN_THRESHOLD_PX
+                            or abs(rect.right - visible_rect.right) > DRAG_UNPIN_THRESHOLD_PX
+                            or abs(rect.bottom - visible_rect.bottom) > DRAG_UNPIN_THRESHOLD_PX
+                        ):
+                            with self._lock:
+                                self._clear_slot(edge, restore=False)
+                            continue
                         if cursor_over_window:
                             with self._lock:
                                 self._slots[edge]["_polls"] = 0
@@ -731,6 +746,29 @@ def make_tray_icon(slider):
     def on_show(icon, item):
         slider.show_current()
 
+    def show_hide_swooshhh(icon, item):
+        root = getattr(icon, "_gui_root", None)
+        if not root:
+            return
+        try:
+            if root.winfo_viewable():
+                root.withdraw()
+            else:
+                root.deiconify()
+                root.lift()
+                root.focus_force()
+        except Exception:
+            pass
+
+    def show_hide_swooshhh_label(icon, item):
+        root = getattr(icon, "_gui_root", None)
+        if not root:
+            return "Show Swooshhh"
+        try:
+            return "Hide Swooshhh" if root.winfo_viewable() else "Show Swooshhh"
+        except Exception:
+            return "Show Swooshhh"
+
     def on_exit(icon, item):
         slider.unpin_all()
         if getattr(icon, "_gui_root", None):
@@ -740,11 +778,25 @@ def make_tray_icon(slider):
                 pass
         icon.stop()
 
-    img = Image.new("RGB", (64, 64), color=(45, 55, 72))
-    draw = ImageDraw.Draw(img)
-    draw.rectangle([8, 8, 56, 56], outline=(99, 179, 237), width=2)
-    draw.rectangle([0, 24, 12, 40], fill=(99, 179, 237))
-    del draw
+    # Tray icon: use logo PNG if available, else fallback to drawn icon
+    img = None
+    if getattr(sys, "frozen", False):
+        logo_path = os.path.join(sys._MEIPASS, "swooshhh_logo.png")
+    else:
+        logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "swooshhh_logo.png")
+    try:
+        if os.path.isfile(logo_path):
+            img = Image.open(logo_path).copy()
+            img = img.convert("RGB")
+            img = img.resize((64, 64), getattr(Image, "Resampling", Image).LANCZOS)
+    except Exception:
+        pass
+    if img is None:
+        img = Image.new("RGB", (64, 64), color=(45, 55, 72))
+        draw = ImageDraw.Draw(img)
+        draw.rectangle([8, 8, 56, 56], outline=(99, 179, 237), width=2)
+        draw.rectangle([0, 24, 12, 40], fill=(99, 179, 237))
+        del draw
 
     menu = pystray.Menu(
         pystray.MenuItem("Pin current window", on_pin),
@@ -753,6 +805,8 @@ def make_tray_icon(slider):
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Hide (slide off-screen)", on_hide),
         pystray.MenuItem("Show (slide back)", on_show),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem(show_hide_swooshhh_label, show_hide_swooshhh),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Edge: Left", lambda i, _: slider.set_edge(EDGE_LEFT)),
         pystray.MenuItem("Edge: Right", lambda i, _: slider.set_edge(EDGE_RIGHT)),
@@ -886,6 +940,7 @@ def main():
 
     slider = WindowSlider()
     slider.set_edge(args.edge)
+    atexit.register(slider.unpin_all)  # Restore any hidden windows when process exits
 
     hotkey_thread = threading.Thread(target=run_hotkey_thread, args=(slider,), daemon=True)
     hotkey_thread.start()
