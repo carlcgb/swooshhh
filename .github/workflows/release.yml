@@ -1,4 +1,4 @@
-# Build swooshhh.exe and attach it to a GitHub Release.
+# Build swooshhh.exe and attach to GitHub Release.
 # Create a Release (e.g. v1.0.0) on the Releases page to trigger this.
 name: Release
 
@@ -7,7 +7,7 @@ on:
     types: [published]
 
 jobs:
-  build-exe:
+  build:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,7 +26,7 @@ jobs:
       - name: Build swooshhh.exe
         run: pyinstaller --onefile --windowed --name swooshhh swooshhh.py
 
-      - name: Upload swooshhh.exe to Release
+      - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/swooshhh.exe
