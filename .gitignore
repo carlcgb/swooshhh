@@ -2,7 +2,6 @@
 build/
 dist/
 *.spec
-swooshhh.ico
 
 # Python
 .venv/

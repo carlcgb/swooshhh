@@ -1,29 +1,12 @@
 @echo off
 cd /d "%~dp0"
 
-REM Prefer py (Python Launcher), then python
 set PY=
-where py >nul 2>&1
-if %errorlevel% equ 0 (
-  set PY=py
-  set PYW=py
-)
+where py >nul 2>&1 && set PY=py
+if "%PY%"=="" where python >nul 2>&1 && set PY=python
 if "%PY%"=="" (
-  where python >nul 2>&1
-  if %errorlevel% equ 0 (
-    set PY=python
-    set PYW=pythonw
-  )
-)
-if "%PY%"=="" (
-  echo Python was not found.
-  echo.
-  echo Turn ON the "py.exe" alias:
-  echo   Settings - Apps - Advanced app settings - App execution aliases
-  echo   Find "Python install manager" - py.exe - turn it ON.
-  echo.
-  echo Or install Python from https://www.python.org/downloads/
-  echo and check "Add Python to PATH".
+  echo Python not found. Enable "py.exe" in App execution aliases or add Python to PATH.
+  echo https://www.python.org/downloads/
   pause
   exit /b 1
 )
@@ -32,26 +15,33 @@ if "%~1"=="" (
   start "" %PY% swooshhh.py --gui
   exit /b 0
 )
-if /i "%~1"=="tray" (
-  %PYW% swooshhh.py
-  if errorlevel 1 %PY% swooshhh.py
-  exit /b 0
-)
 if /i "%~1"=="gui" (
   %PY% swooshhh.py --gui
-  if errorlevel 1 (
-    echo Failed to run. Install deps: %PY% -m pip install -r requirements.txt
-    pause
-  )
+  if errorlevel 1 echo Install deps: run.cmd install
+  exit /b 0
+)
+if /i "%~1"=="tray" (
+  pythonw swooshhh.py 2>nul || %PY% swooshhh.py
+  exit /b 0
+)
+if /i "%~1"=="install" (
+  %PY% -m pip install -r requirements.txt
+  echo Run: run.cmd  or  run.cmd gui
+  pause
   exit /b 0
 )
 if /i "%~1"=="build" (
-  call build_exe.bat
+  %PY% -m pip install pyinstaller --quiet
+  %PY% -m PyInstaller --onefile --windowed --name swooshhh swooshhh.py
+  if exist "dist\swooshhh.exe" (echo Built: dist\swooshhh.exe) else (echo Build failed. & exit /b 1)
+  pause
   exit /b 0
 )
-echo Usage: run.cmd [tray^|gui^|build]
+
+echo Usage: run.cmd [gui^|tray^|install^|build]
 echo   (no args) = start with GUI
-echo   tray      = tray only, no window
-echo   gui       = same as no args
-echo   build     = create swooshhh.exe
+echo   gui       = run with GUI
+echo   tray      = tray only
+echo   install   = pip install -r requirements.txt
+echo   build     = create dist\swooshhh.exe
 pause
