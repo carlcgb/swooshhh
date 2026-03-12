@@ -54,7 +54,7 @@ HELP_TEXT = """Pin a window to an edge (Left / Right / Top / Bottom), then slide
 • Hotkeys: Ctrl+Alt+Arrow — pin and hide in one step.
 • Reveal: Hover the screen edge. A blue dot shows where a window is hidden.
 • Slide back: Move the mouse off the window.
-• One window per edge (max 4). Use the tray menu for Hide / Show."""
+• One window per edge (max 4). Tray: Unpin all, Help, Show GUI, Exit."""
 
 MOD_HOTKEY = win32con.MOD_ALT | win32con.MOD_CONTROL
 VK_LEFT = 0x25
