@@ -21,7 +21,7 @@ if /i "%~1"=="gui" (
   exit /b 0
 )
 if /i "%~1"=="tray" (
-  pythonw swooshhh.py 2>nul || %PY% swooshhh.py
+  %PY% swooshhh.py
   exit /b 0
 )
 if /i "%~1"=="install" (
@@ -32,7 +32,9 @@ if /i "%~1"=="install" (
 )
 if /i "%~1"=="build" (
   %PY% -m pip install pyinstaller --quiet
-  %PY% -m PyInstaller --onefile --windowed --name swooshhh swooshhh.py
+  %PY% make_icon.py
+  if not exist swooshhh.ico (echo swooshhh.ico not created. & exit /b 1)
+  %PY% -m PyInstaller --onefile --windowed --clean --icon=swooshhh.ico --name swooshhh swooshhh.py
   if exist "dist\swooshhh.exe" (echo Built: dist\swooshhh.exe) else (echo Build failed. & exit /b 1)
   pause
   exit /b 0

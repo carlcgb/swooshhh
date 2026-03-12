@@ -16,19 +16,24 @@ from collections import namedtuple
 import win32api
 import win32con
 import win32gui
+import win32process
 from PIL import Image, ImageDraw
 import pystray
 
 byref = ctypes.byref
 user32 = ctypes.windll.user32
-gdi32 = ctypes.windll.gdi32
 WM_HOTKEY = 0x0312
 WM_APP = 0x8000
 SW_HIDE = 0
-SW_SHOW = 5
+SW_SHOWNA = 8
+SWP_NOMOVE = 0x0002
+SWP_NOSIZE = 0x0001
+SWP_NOACTIVATE = 0x0010
+HWND_TOPMOST = 0xFFFFFFFF
 WS_POPUP = 0x80000000
 WS_EX_TOPMOST = 0x00000008
 WS_EX_TOOLWINDOW = 0x00000080
+GWL_EXSTYLE = -20
 CS_HREDRAW = 0x0002
 CS_VREDRAW = 0x0001
 
@@ -42,8 +47,8 @@ TRIGGER_ZONE_PX = 14
 ANIMATION_MS = 200
 POLL_INTERVAL = 0.035
 INDICATOR_COLOR = (0x4A, 0x90, 0xD9)
-INDICATOR_SIZE = 32
-INDICATOR_THICKNESS = 3
+INDICATOR_SIZE = 44
+INDICATOR_THICKNESS = 6
 HELP_TEXT = """Pin a window to an edge (Left / Right / Top / Bottom), then slide it off-screen.
 
 • Hotkeys: Ctrl+Alt+Arrow — pin and hide in one step.
@@ -58,23 +63,6 @@ VK_RIGHT = 0x27
 VK_DOWN = 0x28
 
 SavedRect = namedtuple("SavedRect", "left top right bottom")
-
-
-class WNDCLASSEXW(ctypes.Structure):
-    _fields_ = [
-        ("cbSize", wintypes.UINT),
-        ("style", wintypes.UINT),
-        ("lpfnWndProc", ctypes.c_void_p),
-        ("cbClsExtra", ctypes.c_int),
-        ("cbWndExtra", ctypes.c_int),
-        ("hInstance", wintypes.HANDLE),
-        ("hIcon", wintypes.HANDLE),
-        ("hCursor", wintypes.HANDLE),
-        ("hbrBackground", wintypes.HANDLE),
-        ("lpszMenuName", ctypes.c_wchar_p),
-        ("lpszClassName", ctypes.c_wchar_p),
-        ("hIconSm", wintypes.HANDLE),
-    ]
 
 
 def get_foreground_hwnd():
@@ -92,7 +80,7 @@ def get_window_rect(hwnd):
 def set_window_rect(hwnd, rect, flags=0):
     if rect is None:
         return
-    flags = flags or win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE
+    flags = flags or win32con.SWP_NOACTIVATE
     win32gui.SetWindowPos(
         hwnd,
         win32con.HWND_TOP,
@@ -135,6 +123,98 @@ def get_window_title(hwnd):
         return ""
 
 
+def _rects_intersect(left1, top1, right1, bottom1, left2, top2, right2, bottom2):
+    return not (right1 < left2 or left1 > right2 or bottom1 < top2 or top1 > bottom2)
+
+
+# Native Windows / shell window class names to exclude from the window list
+_NATIVE_WINDOWS_CLASSES = frozenset({
+    "Shell_TrayWnd",
+    "Shell_SecondaryTrayWnd",
+    "Progman",
+    "WorkerW",
+    "CabinetWClass",
+    "ExploreWClass",
+    "SearchWindow",
+    "ApplicationFrameWindow",
+    "Windows.UI.Core.CoreWindow",
+})
+
+
+def _monitor_rect_for_window(hwnd):
+    """Return (left, top, right, bottom) for the monitor that contains the given window, or None to use primary."""
+    try:
+        MONITOR_DEFAULTTONEAREST = 2
+        mon = win32api.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+        info = win32api.GetMonitorInfo(mon)
+        r = info["Monitor"]
+        return (r[0], r[1], r[2], r[3])
+    except Exception:
+        return None
+
+
+def get_open_windows(exclude_hwnd=None):
+    """Return list of (display_title, hwnd) for visible, non-minimized top-level windows on the same monitor as the app. Excludes tray/tool windows, native Windows shell windows, and Swooshhh's own windows."""
+    result = []
+    title_count = {}
+    if exclude_hwnd:
+        rect = _monitor_rect_for_window(exclude_hwnd)
+    else:
+        rect = None
+    if rect is None:
+        sw, sh = get_primary_screen_size()
+        main_left, main_top, main_right, main_bottom = 0, 0, sw, sh
+    else:
+        main_left, main_top, main_right, main_bottom = rect
+
+    def enum_cb(hwnd, _):
+        try:
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+            if win32gui.IsIconic(hwnd):
+                return True
+            if win32gui.GetParent(hwnd):
+                return True
+            if exclude_hwnd and hwnd == exclude_hwnd:
+                return True
+            try:
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                if pid == os.getpid():
+                    return True
+            except Exception:
+                pass
+            try:
+                if win32gui.GetClassName(hwnd) in _NATIVE_WINDOWS_CLASSES:
+                    return True
+            except Exception:
+                pass
+            try:
+                ex_style = win32gui.GetWindowLong(hwnd, GWL_EXSTYLE)
+                if ex_style & WS_EX_TOOLWINDOW:
+                    return True
+            except Exception:
+                pass
+            rect = win32gui.GetWindowRect(hwnd)
+            if not _rects_intersect(rect[0], rect[1], rect[2], rect[3], main_left, main_top, main_right, main_bottom):
+                return True
+            title = (win32gui.GetWindowText(hwnd) or "").strip()
+            if not title:
+                return True
+            key = title
+            title_count[key] = title_count.get(key, 0) + 1
+            if title_count[key] > 1:
+                display = f"{title} [{title_count[key]}]"
+            else:
+                display = title
+            result.append((display, hwnd))
+        except Exception:
+            pass
+        return True
+
+    win32gui.EnumWindows(enum_cb, None)
+    return result
+
+
 def _interp_rect(r0, r1, t):
     """Linear interpolate from r0 to r1; t in [0,1]. Returns SavedRect."""
     return SavedRect(
@@ -175,12 +255,10 @@ def _hidden_rect_centered(edge, width, height, sw, sh):
 
 _HOTKEY_IDS = {1: EDGE_LEFT, 2: EDGE_RIGHT, 3: EDGE_TOP, 4: EDGE_BOTTOM}
 _indicator_hwnds = [None] * 4
-_manager_wndproc_ref = None
-_indicator_wndproc_ref = None
 
 
 def _create_edge_indicators(slider):
-    global _indicator_hwnds, _manager_wndproc_ref, _indicator_wndproc_ref
+    global _indicator_hwnds
     try:
         sw, sh = get_primary_screen_size()
         half = INDICATOR_SIZE // 2
@@ -193,76 +271,72 @@ def _create_edge_indicators(slider):
             (sw // 2 - half, sh - t, s, t),
         ]
         rgb = INDICATOR_COLOR
-        color = rgb[0] | (rgb[1] << 8) | (rgb[2] << 16)
-        brush = gdi32.CreateSolidBrush(color)
-
-        WNDPROC = ctypes.CFUNCTYPE(ctypes.c_long, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+        color_ref = win32api.RGB(rgb[0], rgb[1], rgb[2])
+        brush = win32gui.CreateSolidBrush(color_ref)
 
         def manager_wndproc(hwnd, msg, wParam, lParam):
             if msg == WM_APP + 1:
                 idx = wParam & 0xFFFF
                 show = lParam & 0xFFFF
-                if 0 <= idx < 4 and _indicator_hwnds[idx] and user32.IsWindow(_indicator_hwnds[idx]):
-                    user32.ShowWindow(_indicator_hwnds[idx], SW_SHOW if show else SW_HIDE)
+                if 0 <= idx < 4 and _indicator_hwnds[idx] and win32gui.IsWindow(_indicator_hwnds[idx]):
+                    ind_hwnd = _indicator_hwnds[idx]
+                    win32gui.ShowWindow(ind_hwnd, win32con.SW_SHOWNA if show else win32con.SW_HIDE)
+                    if show:
+                        win32gui.SetWindowPos(
+                            ind_hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
+                            win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE
+                        )
                 return 0
-            return user32.DefWindowProcW(hwnd, msg, wParam, lParam)
+            return win32gui.DefWindowProc(hwnd, msg, wParam, lParam)
 
         def indicator_wndproc(hwnd, msg, wParam, lParam):
-            return user32.DefWindowProcW(hwnd, msg, wParam, lParam)
+            if msg == win32con.WM_PAINT:
+                try:
+                    dc, ps = win32gui.BeginPaint(hwnd)
+                    r = win32gui.GetClientRect(hwnd)
+                    win32gui.FillRect(dc, r, brush)
+                    win32gui.EndPaint(hwnd, ps)
+                except Exception:
+                    pass
+                return 0
+            return win32gui.DefWindowProc(hwnd, msg, wParam, lParam)
 
-        _manager_wndproc_ref = WNDPROC(manager_wndproc)
-        _indicator_wndproc_ref = WNDPROC(indicator_wndproc)
+        hinst = win32api.GetModuleHandle(None)
 
-        hinst = ctypes.windll.kernel32.GetModuleHandleW(None)
-        wc = WNDCLASSEXW()
-        wc.cbSize = ctypes.sizeof(WNDCLASSEXW)
-        wc.style = CS_HREDRAW | CS_VREDRAW
-        wc.lpfnWndProc = _manager_wndproc_ref
-        wc.cbClsExtra = 0
-        wc.cbWndExtra = 0
-        wc.hInstance = hinst
-        wc.hIcon = 0
-        wc.hCursor = 0
-        wc.hbrBackground = 0
-        wc.lpszMenuName = None
-        wc.lpszClassName = "SwooshhhIndicatorMgr"
-        wc.hIconSm = 0
-        if not user32.RegisterClassExW(byref(wc)):
-            return
-        manager_hwnd = user32.CreateWindowExW(
+        wc_mgr = win32gui.WNDCLASS()
+        wc_mgr.style = win32con.CS_HREDRAW | win32con.CS_VREDRAW
+        wc_mgr.lpfnWndProc = manager_wndproc
+        wc_mgr.hInstance = hinst
+        wc_mgr.lpszClassName = "SwooshhhIndicatorMgr"
+        win32gui.RegisterClass(wc_mgr)
+
+        manager_hwnd = win32gui.CreateWindowEx(
             0, "SwooshhhIndicatorMgr", None, 0, 0, 0, 0, 0, None, None, hinst, None
         )
         if not manager_hwnd:
             return
         slider._indicator_manager_hwnd = manager_hwnd
 
-        wc2 = WNDCLASSEXW()
-        wc2.cbSize = ctypes.sizeof(WNDCLASSEXW)
-        wc2.style = CS_HREDRAW | CS_VREDRAW
-        wc2.lpfnWndProc = _indicator_wndproc_ref
-        wc2.cbClsExtra = 0
-        wc2.cbWndExtra = 0
-        wc2.hInstance = hinst
-        wc2.hIcon = 0
-        wc2.hCursor = 0
-        wc2.hbrBackground = brush
-        wc2.lpszMenuName = None
-        wc2.lpszClassName = "SwooshhhIndicator"
-        wc2.hIconSm = 0
-        if not user32.RegisterClassExW(byref(wc2)):
-            return
+        wc_ind = win32gui.WNDCLASS()
+        wc_ind.style = win32con.CS_HREDRAW | win32con.CS_VREDRAW
+        wc_ind.lpfnWndProc = indicator_wndproc
+        wc_ind.hInstance = hinst
+        wc_ind.hbrBackground = brush
+        wc_ind.lpszClassName = "SwooshhhIndicator"
+        win32gui.RegisterClass(wc_ind)
+
         for i, (x, y, w, h) in enumerate(positions):
-            hwnd = user32.CreateWindowExW(
-                WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            hwnd = win32gui.CreateWindowEx(
+                win32con.WS_EX_TOPMOST | win32con.WS_EX_TOOLWINDOW,
                 "SwooshhhIndicator",
                 None,
-                WS_POPUP,
+                win32con.WS_POPUP,
                 x, y, w, h,
                 None, None, hinst, None
             )
             if hwnd:
                 _indicator_hwnds[i] = hwnd
-                user32.ShowWindow(hwnd, SW_HIDE)
+                win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
         return manager_hwnd
     except Exception:
         pass
@@ -302,9 +376,11 @@ class WindowSlider:
     def _has_any_window(self):
         return any(self._slots[e]["hwnd"] for e in EDGES)
 
-    def pin_current(self):
-        hwnd = get_foreground_hwnd()
+    def pin_current(self, exclude_hwnds=None, hwnd=None):
+        hwnd = hwnd if (hwnd and is_window_valid(hwnd)) else get_foreground_hwnd()
         if not hwnd or not is_window_valid(hwnd):
+            return False
+        if exclude_hwnds and hwnd in exclude_hwnds:
             return False
         edge = self.edge
         with self._lock:
@@ -315,6 +391,7 @@ class WindowSlider:
             self._slots[edge]["hidden"] = False
             self._slots[edge]["_polls"] = 0
             self._ensure_worker()
+            self._indicator_show(edge, True)
         return True
 
     def _clear_slot(self, edge):
@@ -426,6 +503,10 @@ class WindowSlider:
 
                     if hidden:
                         if at_edge and in_range:
+                            win32gui.SetWindowPos(
+                                hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
+                                win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE
+                            )
                             for i in range(1, steps + 1):
                                 if self._stop.is_set():
                                     break
@@ -436,7 +517,10 @@ class WindowSlider:
                                 time.sleep(POLL_INTERVAL)
                             with self._lock:
                                 self._slots[edge]["hidden"] = False
-                                self._indicator_show(edge, False)
+                            win32gui.SetWindowPos(
+                                hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
+                                win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE
+                            )
                     else:
                         if cursor_over_window:
                             with self._lock:
@@ -457,6 +541,10 @@ class WindowSlider:
                                 with self._lock:
                                     self._slots[edge]["hidden"] = True
                                     self._slots[edge]["_polls"] = 0
+                                win32gui.SetWindowPos(
+                                    hwnd, win32con.HWND_NOTOPMOST, 0, 0, 0, 0,
+                                    win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE
+                                )
                                 self._indicator_show(edge, True)
                 except Exception:
                     pass
@@ -477,6 +565,10 @@ class WindowSlider:
         sw, sh = get_primary_screen_size()
         hidden_rect = _hidden_rect_centered(edge, width, height, sw, sh)
         set_window_rect(hwnd, hidden_rect)
+        win32gui.SetWindowPos(
+            hwnd, win32con.HWND_NOTOPMOST, 0, 0, 0, 0,
+            win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE
+        )
         with self._lock:
             self._slots[edge]["saved_rect"] = saved
             self._slots[edge]["hidden"] = True
@@ -500,6 +592,10 @@ class WindowSlider:
         sw, sh = get_primary_screen_size()
         docked = _docked_rect_centered(self.edge, width, height, sw, sh)
         set_window_rect(hwnd, docked)
+        win32gui.SetWindowPos(
+            hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
+            win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE
+        )
         with self._lock:
             self._slots[self.edge]["hidden"] = False
 
@@ -525,19 +621,12 @@ class WindowSlider:
             manager = getattr(self, "_indicator_manager_hwnd", None)
             if manager and user32.IsWindow(manager):
                 idx = EDGES.index(edge)
-                user32.PostMessageW(manager, WM_APP + 1, idx, 1 if show else 0)
+                user32.SendMessageW(manager, WM_APP + 1, idx, 1 if show else 0)
         except Exception:
             pass
 
 
 def make_tray_icon(slider):
-    def pin_to_edge(edge):
-        slider.set_edge(edge)
-        if slider.pin_current():
-            icon.notify(f"Pinned to {edge} edge.", "Swooshhh")
-        else:
-            icon.notify("Focus a window first, then try again.", "Swooshhh")
-
     def on_unpin_all(icon, item):
         slider.unpin_all()
         icon.notify("Unpinned all.", "Swooshhh")
@@ -578,11 +667,6 @@ def make_tray_icon(slider):
     del draw
 
     menu = pystray.Menu(
-        pystray.MenuItem("Pin left edge", lambda i, _: pin_to_edge(EDGE_LEFT)),
-        pystray.MenuItem("Pin right edge", lambda i, _: pin_to_edge(EDGE_RIGHT)),
-        pystray.MenuItem("Pin top edge", lambda i, _: pin_to_edge(EDGE_TOP)),
-        pystray.MenuItem("Pin bottom edge", lambda i, _: pin_to_edge(EDGE_BOTTOM)),
-        pystray.Menu.SEPARATOR,
         pystray.MenuItem("Unpin all", on_unpin_all),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Help", on_help),
@@ -652,13 +736,45 @@ def run_gui(slider, start_minimized=False):
                 status_text.set(f"{edge_name} edge · {'hidden' if hidden else 'visible'}")
         root.after(800, update_status)
 
+    windows_list = []
+
+    def refresh_windows():
+        nonlocal windows_list
+        try:
+            gui_hwnd = root.winfo_id()
+            windows_list = get_open_windows(exclude_hwnd=gui_hwnd)
+        except Exception:
+            windows_list = []
+        display_values = [t for t, _ in windows_list]
+        window_combo["values"] = display_values
+        if display_values and window_combo.current() < 0:
+            window_combo.current(0)
+
+    def get_selected_hwnd():
+        idx = window_combo.current()
+        if 0 <= idx < len(windows_list):
+            return windows_list[idx][1]
+        return None
+
     def pin_to_edge(edge):
         slider.set_edge(edge)
-        slider.pin_current()
+        hwnd = get_selected_hwnd()
+        try:
+            exclude = [root.winfo_id()]
+        except Exception:
+            exclude = None
+        if not slider.pin_current(exclude_hwnds=exclude, hwnd=hwnd):
+            status_text.set("Select a window from the list, then click Pin to edge.")
         update_status()
 
     pin_f = ttk.LabelFrame(main, text="Pin window to edge", padding=12)
     pin_f.pack(fill=tk.X, pady=6)
+    row0 = ttk.Frame(pin_f)
+    row0.pack(fill=tk.X, pady=(0, 8))
+    ttk.Label(row0, text="Window:").pack(side=tk.LEFT, padx=(0, 6))
+    window_combo = ttk.Combobox(row0, state="readonly", width=32)
+    window_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+    ttk.Button(row0, text="Refresh", command=refresh_windows).pack(side=tk.LEFT)
     pin_inner = ttk.Frame(pin_f)
     pin_inner.pack(anchor=tk.CENTER)
     pad = 8
@@ -668,6 +784,7 @@ def run_gui(slider, start_minimized=False):
     ttk.Button(pin_inner, text="Pin bottom edge", command=lambda: pin_to_edge(EDGE_BOTTOM)).grid(row=2, column=1, padx=pad, pady=(pad, 0))
     pin_inner.grid_columnconfigure(1, minsize=100)
     pin_inner.grid_rowconfigure(1, minsize=36)
+    root.after(300, refresh_windows)
 
     unpin_f = ttk.Frame(main)
     unpin_f.pack(fill=tk.X, pady=4)
